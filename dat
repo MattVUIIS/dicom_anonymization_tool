@@ -1,0 +1,210 @@
+#!/usr/bin/env python
+import argparse
+import errno
+import logging
+import logging.handlers
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+VERSION = (1, 0)
+logger = logging.getLogger('dat')
+
+
+def create_remap(config_xml, remap_csv, input_folder):
+    command = 'DicomSummarize -c {0} -v {1}'.format(config_xml, remap_csv).split()
+    command.append(input_folder)
+    logger.debug('DicomSummarize command: {0}'.format(' '.join(command)))
+    try:
+        result = subprocess.call(command)
+    except OSError as e:
+        logger.error('Unable to call DicomSummarize - make sure that the '
+            'DicomBrowser command line tools are installed, in this shell\'s '
+            'PATH, and this shell has permissions to call it')
+        sys.exit(1)
+    logger.debug('DicomSummarize result: {0}'.format(result))
+    return result
+
+
+def prepare_remap(remap_csv, output_remap_csv, transform_func):
+    ''' Runs a transform function on each line in the remap.csv file '''
+    tmp_fd, tmp_name = tempfile.mkstemp()
+    with os.fdopen(tmp_fd, 'w') as outfile:
+        try:
+            with open(remap_csv, 'r') as f:
+                #Skip the first line
+                line = f.readline().rstrip()
+                logger.debug('csv line: {0}'.format(line))
+                outfile.write(line + '\n')
+                line = f.readline().rstrip()
+                while line:
+                    #Replace the line
+                    rep_line = transform_func(line)
+                    logger.debug('csv line: {0}'.format(rep_line))
+                    outfile.write(rep_line + '\n')
+                    line = f.readline().rstrip()
+        except IOError as e:
+            logger.error('Unable to open remap csv file: {0}'.format(e))
+    shutil.copyfile(tmp_name, output_remap_csv)
+    try:
+        os.remove(tmp_name)
+    except:
+        pass
+
+
+def remap(config_xml, remap_csv, input_folder, output_folder):
+    command = 'DicomRemap -c {0} -v {1} -o'.format(config_xml, remap_csv).split()
+    command.append(output_folder)
+    command.append(input_folder)
+    logger.debug('DicomRemap command: {0}'.format(' '.join(command)))
+    result = subprocess.call(command)
+    logger.debug('DicomRemap result: {0}'.format(result))
+    if result != 0:
+        return result
+    #DicomRemap creates another folder inside the output folder
+    #We want to move those files to the outer folder and remove the inner folder
+    inner_path = os.path.join(output_folder, os.path.basename(input_folder))
+    for root, dirs, files in os.walk(inner_path):
+        for basename in files:
+            full_name = os.path.join(root, basename)
+            shutil.move(full_name, os.path.join(output_folder, basename))
+    shutil.rmtree(inner_path)
+    return result
+
+
+def anonymize(options):
+    options.input = os.path.normpath(options.input)
+    options.output = os.path.normpath(options.output)
+    if not os.path.isdir(options.input):
+        input_folder = tempfile.mkdtemp(dir=os.getcwd())
+        output_folder = tempfile.mkdtemp(dir=os.getcwd())
+        shutil.copy(options.input, input_folder)
+        try:
+            anonymize_impl(options, input_folder, output_folder)
+            for root, dirs, files in os.walk(output_folder):
+                for basename in files:
+                    full_name = os.path.join(root, basename)
+                    shutil.copyfile(full_name, options.output)
+        finally:
+            shutil.rmtree(input_folder)
+            shutil.rmtree(output_folder)
+    else:
+        anonymize_impl(options, options.input, options.output)
+
+
+def anonymize_impl(options, input_folder, output_folder):
+    result = create_remap(options.config_xml, options.remap_csv, input_folder)
+    if result != 0:
+        return False
+    replacement = '"{0}"'.format(options.replacement)
+    prepare_remap(options.remap_csv, options.remap_csv,
+        lambda line: re.sub(r'""', replacement, line))
+    remap(options.config_xml, options.remap_csv, input_folder, output_folder)
+    return True
+
+
+def deanonymize(options):
+    options.input = os.path.normpath(options.input)
+    options.output = os.path.normpath(options.output)
+    options.remap_csv = os.path.normpath(options.remap_csv)
+    if not os.path.isdir(options.input):
+        input_folder = tempfile.mkdtemp(dir=os.getcwd())
+        output_folder = tempfile.mkdtemp(dir=os.getcwd())
+        shutil.copy(options.input, input_folder)
+        try:
+            deanonymize_impl(options, input_folder, output_folder)
+            for root, dirs, files in os.walk(output_folder):
+                for basename in files:
+                    full_name = os.path.join(root, basename)
+                    shutil.copyfile(full_name, options.output)
+        finally:
+            shutil.rmtree(input_folder)
+            shutil.rmtree(output_folder)
+    else:
+        deanonymize_impl(options, options.input, options.output)
+
+
+def deanonymize_impl(options, input_folder, output_folder):
+    remap_csv_dir, remap_csv_base = os.path.split(options.remap_csv)
+    remap_csv_base, _ = os.path.splitext(remap_csv_base)
+    remap_csv_rev = os.path.join(remap_csv_dir, remap_csv_base + '-reverse.csv')
+    def flip_fields(line):
+        fields = line.split(',')
+        fields_flipped = [(field[1], field[0])
+            for field in zip(fields[1::2], fields[2::2])]
+        fields_flattened = [field for t in fields_flipped for field in t]
+        return ','.join([fields[0]] + fields_flattened)
+    prepare_remap(options.remap_csv, remap_csv_rev, flip_fields)
+    remap(options.config_xml, remap_csv_rev, input_folder, output_folder)
+
+
+this_script_dir, this_script_name = os.path.split(os.path.realpath(__file__))
+parser = argparse.ArgumentParser(this_script_name, description='''
+Anonymizes/Deanonymizes a set of DICOMs using the DicomBrowser command line tools
+''')
+parser.add_argument('--level', default='INFO', choices=('DEBUG', 'INFO',
+    'WARNING', 'ERROR', 'CRITICAL'), help='log level')
+subparsers = parser.add_subparsers()
+
+anonymize_parser = subparsers.add_parser('anonymize', description='''
+Anonymizes a set of DICOMs using the DicomBrowser command line tools
+''', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+anonymize_parser.set_defaults(func=anonymize)
+anonymize_parser.add_argument('input', help='''
+Input deanonymized DICOM or folder containing the deanonymized DICOMs
+''')
+anonymize_parser.add_argument('output', help='''
+Output deanonymized DICOM or folder that will contain the anonymized DICOMs
+''')
+anonymize_parser.add_argument('--config-xml', required=True, help='''
+Remapping configuration xml file that specifies the fields in the DICOMs to be anonymized
+''')
+anonymize_parser.add_argument('--remap-csv', required=True, help='''
+CSV file to produce with the DicomSummarize command line tool from DicomBrowser
+''')
+anonymize_parser.add_argument('-r', '--replacement', default='XXXXXX', help='''
+Replacement value used to anonymize
+''')
+
+deanonymize_parser = subparsers.add_parser('deanonymize', description='''
+Deanonymizes a set of DICOMs using the DicomBrowser command line tools
+''', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+deanonymize_parser.set_defaults(func=deanonymize)
+deanonymize_parser.add_argument('input', help='''
+Input anonymized DICOM or folder containing the anonymized DICOMs
+''')
+deanonymize_parser.add_argument('output', help='''
+Output anonymized DICOM or folder that will contain the deanonymized DICOMs
+''')
+deanonymize_parser.add_argument('--config-xml', required=True, help='''
+Remapping configuration xml file that specifies the fields in the DICOMs to be deanonymized
+''')
+deanonymize_parser.add_argument('--remap-csv', required=True, help='''
+CSV file produced by the DicomSummarize command line tool from DicomBrowser (this file must exist)
+''')
+
+
+#Set up the logger
+_formatter = logging.Formatter('%(levelname)s: %(message)s')
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_formatter)
+logger.addHandler(_stream_handler)
+
+
+if __name__ == '__main__':
+    options = parser.parse_args()
+    #Converts the given string into a log level from the logging module
+    try:
+        _log_level = int(options.level)
+    except ValueError:
+        try:
+            _log_level = getattr(logging, options.level)
+        except AttributeError:
+            raise ValueError('Invalid log level: {0}'.format(options.level))
+    logger.setLevel(_log_level)
+    options.func(options)
+
